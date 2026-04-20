@@ -1,0 +1,22 @@
+{
+  "name": "poly-arb-bot",
+  "version": "0.1.0",
+  "description": "Polymarket same-market arbitrage bot: buys YES + NO when ask(YES)+ask(NO) < $1.00 and takes the spread at resolution.",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "poly-arb": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "scan": "BOT_MODE=monitor node src/index.js",
+    "auto": "BOT_MODE=auto node src/index.js",
+    "test": "node --test test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {}
+}
