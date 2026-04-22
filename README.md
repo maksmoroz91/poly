@@ -79,21 +79,36 @@ Uses Node's built-in test runner — no test dependencies to install.
 src/
   config.js            env/.env parsing + validation
   logger.js            timestamped console logger
+  retry.js             exponential backoff + jitter helper for HTTP calls
+  ttl-cache.js         bounded TTL cache for signal dedupe
   polymarket/
-    client.js          Gamma API fetch + market normalization
+    client.js          Gamma + CLOB API client (paginated, retried)
   scanner.js           filters + arb math
   categorize.js        esports / politics / crypto classifier
-  telegram.js          Bot API notifier + signal formatter
-  executor.js          parallel YES+NO buyer with rollback
+  telegram.js          Bot API notifier with retry + async send queue
+  executor.js          parallel YES+NO buyer; real-ask re-check + naked-leg alert
   index.js             main loop
 test/                  unit tests for every module above
 ```
 
 ## Safety
 
-- The arbitrage math assumes both legs fill at the quoted ask. In auto mode
-  the executor should re-check the real top-of-book just before firing; the
-  injected `placeOrder` hook is the right place to add that.
-- Rollback is best-effort: if one leg fills and the cancel of the other
-  fails, the operator must reconcile manually.
+- In auto mode the executor pulls the real top-of-book ask from the CLOB
+  (`/book?token_id=...`) and re-validates the arb (sum + size) before placing
+  any order. If the real spread no longer clears `MIN_PROFIT_PERCENT` the
+  trade is aborted with an `aborted: real_ask_too_high` result and no orders
+  are placed.
+- Rollback distinguishes two failure modes: a benign network miss is logged,
+  but an `already_filled` cancel response triggers a critical Telegram alert
+  (`🚨 naked leg`) so the operator can reconcile the open position immediately.
+- The Gamma client paginates through `/markets` until the API returns a short
+  page, so no active markets are silently skipped past the first 500.
+- Gamma and Telegram requests retry with exponential backoff + jitter on 429,
+  5xx and transient network errors so a brief outage doesn't drop signals.
+- Telegram dispatch is queued — `enqueue()` returns immediately, so a slow
+  or unreachable Telegram API can never block the scan loop.
+- Signal dedupe uses a 1-hour TTL cache, so a market that briefly disappears
+  from a paginated API response is re-emitted once it reappears with a fresh
+  arb window (instead of being muted until 10 000 distinct markets have been
+  seen).
 - Start with `BOT_MODE=monitor` until you trust the signal quality.
