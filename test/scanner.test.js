@@ -11,6 +11,8 @@ const baseCfg = {
   feePercent: 2,
 };
 
+const silentLogger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+
 function market(overrides = {}) {
   return {
     id: '1',
@@ -64,7 +66,7 @@ test('passesFilters rejects missing legs', () => {
   assert.equal(passesFilters(market({ no: null }), baseCfg), false);
 });
 
-test('scan returns signals sorted by category priority', () => {
+test('scan returns signals sorted by category priority', async () => {
   const esports = market({ id: 'e', conditionId: 'ce', question: 'CS2 major winner' });
   const crypto = market({
     id: 'c',
@@ -85,18 +87,78 @@ test('scan returns signals sorted by category priority', () => {
     no: { price: 0.5, tokenId: 'n3' },
   });
 
-  const signals = scan([crypto, politics, esports], baseCfg);
+  const signals = await scan([crypto, politics, esports], baseCfg, Date.now(), null, silentLogger);
   assert.equal(signals.length, 3);
   assert.equal(signals[0].category, 'esports');
   assert.equal(signals[1].category, 'politics');
   assert.equal(signals[2].category, 'crypto');
 });
 
-test('scan drops opportunities below minProfitPercent', () => {
+test('scan drops opportunities below minProfitPercent', async () => {
   // yes+no = 0.97, fee 2% => threshold 0.98, profit ≈ (0.98-0.97)/0.97 ≈ 1.03%
   const m = market({ yes: { price: 0.48, tokenId: 'y' }, no: { price: 0.49, tokenId: 'n' } });
   const cfgHigh = { ...baseCfg, minProfitPercent: 10 };
-  assert.equal(scan([m], cfgHigh).length, 0);
+  assert.equal((await scan([m], cfgHigh, Date.now(), null, silentLogger)).length, 0);
   const cfgLow = { ...baseCfg, minProfitPercent: 0.5 };
-  assert.equal(scan([m], cfgLow).length, 1);
+  assert.equal((await scan([m], cfgLow, Date.now(), null, silentLogger)).length, 1);
+});
+
+test('scan with fetchOrderBook emits a signal when CLOB sum clears threshold', async () => {
+  // Gamma prices sum to 1.00 (no arb possible on them). CLOB asks are tighter.
+  const m = market({
+    yes: { price: 0.55, tokenId: 'y-clob' },
+    no: { price: 0.45, tokenId: 'n-clob' },
+  });
+  const books = {
+    'y-clob': { bestAsk: { price: 0.45, size: 100 } },
+    'n-clob': { bestAsk: { price: 0.5, size: 100 } },
+  };
+  const fetchOrderBook = async (id) => books[id];
+  const signals = await scan([m], baseCfg, Date.now(), fetchOrderBook, silentLogger);
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].yesAsk, 0.45);
+  assert.equal(signals[0].noAsk, 0.5);
+  assert.ok(signals[0].profitPercent > 0);
+});
+
+test('scan with fetchOrderBook drops markets when CLOB sum fails threshold', async () => {
+  const m = market();
+  const books = {
+    y1: { bestAsk: { price: 0.7, size: 100 } },
+    n1: { bestAsk: { price: 0.35, size: 100 } },
+  };
+  const fetchOrderBook = async (id) => books[id];
+  const signals = await scan([m], baseCfg, Date.now(), fetchOrderBook, silentLogger);
+  assert.equal(signals.length, 0);
+});
+
+test('scan skips a market when fetchOrderBook throws and continues the loop', async () => {
+  const bad = market({ id: 'bad', conditionId: 'bad', slug: 'bad', yes: { price: 0.45, tokenId: 'bad-y' }, no: { price: 0.5, tokenId: 'bad-n' } });
+  const good = market({ id: 'good', conditionId: 'good', slug: 'good', yes: { price: 0.45, tokenId: 'good-y' }, no: { price: 0.5, tokenId: 'good-n' } });
+  const books = {
+    'good-y': { bestAsk: { price: 0.45, size: 100 } },
+    'good-n': { bestAsk: { price: 0.5, size: 100 } },
+  };
+  const fetchOrderBook = async (id) => {
+    if (id.startsWith('bad')) throw new Error('boom');
+    return books[id];
+  };
+  const signals = await scan([bad, good], baseCfg, Date.now(), fetchOrderBook, silentLogger);
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].market.id, 'good');
+});
+
+test('scan falls back to Gamma prices when fetchOrderBook is not provided', async () => {
+  const m = market();
+  const signals = await scan([m], baseCfg, Date.now(), null, silentLogger);
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].yesAsk, 0.45);
+  assert.equal(signals[0].noAsk, 0.5);
+});
+
+test('scan with fetchOrderBook skips market when CLOB has no asks', async () => {
+  const m = market();
+  const fetchOrderBook = async () => ({ bestAsk: null });
+  const signals = await scan([m], baseCfg, Date.now(), fetchOrderBook, silentLogger);
+  assert.equal(signals.length, 0);
 });

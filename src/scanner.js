@@ -1,9 +1,16 @@
 import { categorize, priorityOf } from './categorize.js';
+import { logger as defaultLogger } from './logger.js';
 
-// A market is "ready" when both YES and NO have sensible top-of-book asks.
-// Gamma's outcomePrices field is a midpoint/last trade on many rows, so in
-// auto mode the executor re-checks the real ask from the order book before
-// firing a trade. The scanner uses the cheaper Gamma snapshot for filtering.
+// Gamma's outcomePrices are YES/NO probabilities that sum to $1.00 by
+// definition, so arbitrage math on them can never flag a signal. The real
+// spread lives in the CLOB order book — so when a fetchOrderBook fn is
+// supplied the scanner pulls the top-of-book ask for each candidate and runs
+// the arb math on real prices. Without it we fall back to Gamma prices purely
+// for backwards compatibility (existing callers / tests).
+
+// Soft warning cap: more candidates than this in a single cycle means the
+// filters are too loose and the bot risks hammering CLOB /book.
+const CLOB_WARN_THRESHOLD = 500;
 
 export function daysUntil(endDateIso, now = Date.now()) {
   if (!endDateIso) return Infinity;
@@ -42,13 +49,55 @@ function isFiniteAsk(p) {
   return Number.isFinite(p) && p > 0 && p < 1;
 }
 
-export function scan(markets, cfg, now = Date.now()) {
-  const signals = [];
+export async function scan(markets, cfg, now = Date.now(), fetchOrderBook = null, log = defaultLogger) {
+  const candidates = [];
   for (const market of markets) {
     if (!passesFilters(market, cfg, now)) continue;
+    candidates.push(market);
+  }
+
+  log?.info?.(`scanner: ${candidates.length}/${markets.length} markets passed filters`);
+  if (fetchOrderBook && candidates.length > CLOB_WARN_THRESHOLD) {
+    log?.warn?.(
+      `scanner: ${candidates.length} candidates exceeds CLOB warn threshold ${CLOB_WARN_THRESHOLD}; tighten filters to avoid rate limits`,
+    );
+  }
+
+  const signals = [];
+  let clobChecked = 0;
+  let clobErrors = 0;
+
+  for (const market of candidates) {
+    let yesAsk = market.yes.price;
+    let noAsk = market.no.price;
+
+    if (fetchOrderBook) {
+      try {
+        const [yesBook, noBook] = await Promise.all([
+          fetchOrderBook(market.yes.tokenId),
+          fetchOrderBook(market.no.tokenId),
+        ]);
+        const yesLevel = yesBook?.bestAsk;
+        const noLevel = noBook?.bestAsk;
+        if (!isFiniteAsk(yesLevel?.price) || !isFiniteAsk(noLevel?.price)) {
+          // No real ask on one side means no tradeable arb; skip quietly.
+          continue;
+        }
+        yesAsk = yesLevel.price;
+        noAsk = noLevel.price;
+        clobChecked += 1;
+      } catch (err) {
+        clobErrors += 1;
+        log?.warn?.(
+          `scanner: CLOB book fetch failed for ${market.slug || market.id}: ${err?.message || err}`,
+        );
+        continue;
+      }
+    }
+
     const arb = computeArbitrage({
-      yesAsk: market.yes.price,
-      noAsk: market.no.price,
+      yesAsk,
+      noAsk,
       feePercent: cfg.feePercent,
     });
     if (!arb.isOpportunity) continue;
@@ -59,9 +108,18 @@ export function scan(markets, cfg, now = Date.now()) {
       category,
       priority: priorityOf(category),
       daysToClose: daysUntil(market.endDateIso, now),
+      yesAsk,
+      noAsk,
       ...arb,
     });
   }
+
+  if (fetchOrderBook) {
+    log?.info?.(
+      `scanner: CLOB-checked ${clobChecked}/${candidates.length} candidates (${clobErrors} errors)`,
+    );
+  }
+
   // Highest priority first (esports), then best profit.
   signals.sort((a, b) => a.priority - b.priority || b.profitPercent - a.profitPercent);
   return signals;

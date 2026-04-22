@@ -13,7 +13,13 @@ async function runOnce({ client, cfg, telegram, executor, seen }) {
   const markets = await client.fetchActiveMarkets();
   logger.info(`fetched ${markets.length} markets`);
 
-  const signals = scan(markets, cfg);
+  const signals = await scan(
+    markets,
+    cfg,
+    Date.now(),
+    (tokenId) => client.fetchOrderBook(tokenId),
+    logger,
+  );
   logger.info(`found ${signals.length} arbitrage signals`);
 
   for (const signal of signals) {
